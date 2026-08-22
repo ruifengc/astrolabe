@@ -1,0 +1,21 @@
+[project]
+name = "astrolabe"
+version = "0.3.2"
+description = "记录 AI 行为路径的可观测库 — 低侵入接入 agent/LLM 系统"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/astrolabe"]
+
+[dependency-groups]
+dev = ["pytest", "rich>=13.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tools"]
