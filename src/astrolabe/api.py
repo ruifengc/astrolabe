@@ -1,24 +1,4 @@
-"""Astrolabe — public facade over storage + collection.
-
-Usage::
-
-    from astrolabe import Astrolabe, aspan
-
-    a = Astrolabe(db_path="~/.astrolabe/astrolabe.db")
-
-    # Async host: entry point + ambient spans
-    async def ask(question):
-        async with a.atrace("ask", host="my-agent", question=question):
-            async with aspan("llm.chat", model="deepseek-v4"):
-                ...
-            # auto-flushed on exit of atrace()
-
-    # Sync host
-    def run():
-        with a.trace("job", host="cron", name="nightly"):
-            with span("step1"):
-                ...
-"""
+"""Public collection and query facade; storage implementations stay behind it."""
 
 from __future__ import annotations
 
@@ -28,40 +8,36 @@ from contextlib import asynccontextmanager, contextmanager
 from .backends.sqlite import SQLiteBackend
 from .collector import SpanCollector
 from .context import reset_collector, set_collector
+from .metadata import CaptureLimits
 from .storage import StorageBackend
 
 logger = logging.getLogger(__name__)
-
 _DEFAULT_DB = "~/.astrolabe/astrolabe.db"
 
 
 class Astrolabe:
-    """Facade. One instance per application; thread-safe enough for shared use
-    (SQLite backend uses a single connection with check_same_thread=False)."""
+    """One instance per application. SQLite serializes complete write batches."""
 
-    def __init__(self, db_path: str = _DEFAULT_DB,
-                 *, backend: StorageBackend | None = None):
-        self._backend = backend or SQLiteBackend(db_path)
+    def __init__(self, db_path: str = _DEFAULT_DB, *, backend: StorageBackend | None = None,
+                 readonly: bool = False, limits: CaptureLimits | None = None):
+        self._backend = backend if backend is not None else SQLiteBackend(db_path, readonly=readonly)
+        self._limits = limits or CaptureLimits()
 
     @property
     def backend(self) -> StorageBackend:
         return self._backend
 
-    def create_collector(self, host: str = "",
-                         trace_id: str | None = None) -> SpanCollector:
-        return SpanCollector(self._backend, host=host, trace_id=trace_id)
-
-    # ── entry-point convenience ───────────────────────────────
+    def create_collector(self, host: str = "", trace_id: str | None = None) -> SpanCollector:
+        return SpanCollector(self._backend, host=host, trace_id=trace_id, limits=self._limits)
 
     @contextmanager
     def trace(self, operation: str = "trace", *, host: str = "",
               trace_id: str | None = None, **attrs):
-        """Sync entry point: create collector, install it in the current
-        context, open the root span, flush everything on exit.
+        """Create a request, capture its root, and seal/flush on every exit path.
 
-        ``trace_id``: upstream global trace id when this system is not the
-        first hop of a cross-system chain (see get_trace_context); omitted
-        → this system generates it."""
+        Upstream trace_id joins the global chain; omission generates a new id.
+        Storage failures are logged and never replace host exceptions.
+        """
         collector = self.create_collector(host=host, trace_id=trace_id)
         token = set_collector(collector)
         try:
@@ -69,57 +45,54 @@ class Astrolabe:
                 yield collector
         finally:
             try:
-                collector.flush()
+                collector.close()
             except Exception:
-                # Observability must never break the host: log and continue.
-                # The finally below guarantees the context is always reset.
-                logger.exception("astrolabe: flush failed for %s",
-                                 collector.global_trace_id)
+                logger.exception("astrolabe: flush failed for %s", collector.global_trace_id)
             finally:
                 reset_collector(token)
 
     @asynccontextmanager
     async def atrace(self, operation: str = "trace", *, host: str = "",
                      trace_id: str | None = None, **attrs):
-        """Async entry point: create collector, install it, open the root
-        span, flush everything on exit. ``trace_id`` semantics as in
-        ``trace()``."""
-        collector = self.create_collector(host=host, trace_id=trace_id)
-        token = set_collector(collector)
-        try:
-            async with collector.aspan(operation, **attrs):
-                yield collector
-        finally:
-            try:
-                collector.flush()
-            except Exception:
-                logger.exception("astrolabe: flush failed for %s",
-                                 collector.global_trace_id)
-            finally:
-                reset_collector(token)
+        """Async entry using the same lifecycle as trace(). Flush is synchronous."""
+        with self.trace(operation, host=host, trace_id=trace_id, **attrs) as collector:
+            yield collector
 
-    # ── query delegation ──────────────────────────────────────
-
-    def get_trace(self, trace_id: str, *, host: str = "") -> dict | None:
+    def get_trace(self, trace_id: str, *, host: str | None = None) -> dict | None:
         return self._backend.get_trace(trace_id, host=host)
 
-    def list_traces(self, limit: int = 20, offset: int = 0, *,
-                    status: str = "", host: str = "",
-                    filters: dict | None = None) -> list[dict]:
-        return self._backend.list_traces(
-            limit, offset, status=status, host=host, filters=filters)
+    def get_traces(self, trace_id: str) -> list[dict]:
+        return self._backend.get_traces(trace_id)
 
-    def count_traces(self, *, status: str = "", host: str = "") -> int:
-        return self._backend.count_traces(status=status, host=host)
+    def list_traces(self, limit: int = 20, offset: int = 0, *, status: str = "",
+                    host: str | None = None, filters: dict | None = None) -> list[dict]:
+        return self._backend.list_traces(limit, offset, status=status, host=host, filters=filters)
 
-    def get_trace_spans(self, trace_id: str, *, host: str = "") -> list[dict]:
+    def count_traces(self, *, status: str = "", host: str | None = None,
+                     filters: dict | None = None) -> int:
+        return self._backend.count_traces(status=status, host=host, filters=filters)
+
+    def get_trace_spans(self, trace_id: str, *, host: str | None = None) -> list[dict]:
         return self._backend.get_trace_spans(trace_id, host=host)
 
-    def build_span_tree(self, trace_id: str, *, host: str = "") -> dict | None:
+    def build_span_tree(self, trace_id: str, *, host: str | None = None) -> dict | None:
         return self._backend.build_span_tree(trace_id, host=host)
 
-    def stats(self) -> dict:
-        return self._backend.stats()
+    def build_span_trees(self, trace_id: str) -> list[dict]:
+        return self._backend.build_span_trees(trace_id)
+
+    def operation_stats(self, *, host: str | None = None, filters: dict | None = None,
+                        operation: str | None = None) -> list[dict]:
+        return self._backend.operation_stats(host=host, filters=filters, operation=operation)
+
+    def stats(self, *, host: str | None = None, filters: dict | None = None) -> dict:
+        return self._backend.stats(host=host, filters=filters)
 
     def close(self) -> None:
         self._backend.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

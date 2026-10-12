@@ -7,7 +7,7 @@ span 树查询、聚合指标与 TUI 树状可视化。
 ## 核心设计原则
 
 1. **核心零运行时依赖**：仅标准库（sqlite3 / contextvars / contextlib）。
-   运营工具（tools/）可依赖 rich，不进核心包——被安装的库只含运行时。
+   安装包含标准库 CLI；tools/ 仅保留旧参数兼容入口，不进安装包。
 2. **两表模型**：
    - `traces`：根 span 物化摘要（一请求每系统一行）——服务列表/聚合查询
    - `trace_spans`：完整 span 树（`parent_span_id` 组层级）——服务详情
@@ -29,40 +29,54 @@ span 树查询、聚合指标与 TUI 树状可视化。
 6. **状态双语义**：`traces.status` = done | failed（请求级），
    `trace_spans.status` = ok | error（span 级）。flush 时 root 状态映射
    ok→done / error→failed。
+7. **批次原子性**：collector 只调用 `StorageBackend.write_batch`。后端负责
+   整批序列化、事务、失败回滚与幂等重试；SQLite RLock 覆盖整批及查询。
+   这是唯一写入口；同一 (trace_id, host) 不同根冲突时整批拒绝，保留原记录。
+8. **查询消歧**：host=None 表示不指定，host="" 精确选择空系统。
+   多 host 的 get_trace/build_span_tree 必须指定 host；全系统用 build_span_trees。
 
 ## 目录结构
 
 ```
 astrolabe/
-├── pyproject.toml           # uv 管理；dev 依赖 pytest + rich
+├── pyproject.toml           # uv 管理；dev 依赖 pytest
 ├── src/astrolabe/
 │   ├── api.py               # Astrolabe 门面（trace/atrace 入口 + 查询委托）
 │   ├── collector.py         # SpanCollector 内核 + span/aspan + span 栈
 │   ├── context.py           # contextvars 传播（get/set/reset collector）
+│   ├── metadata.py          # JSON 安全快照 + CaptureLimits
+│   ├── tree.py              # 通用、非递归树构建和子树选择
+│   ├── cli.py               # 随包安装、标准库、只读运维 CLI
 │   ├── storage.py           # StorageBackend 抽象接口（写/查/聚合契约）
 │   ├── schema.py            # DDL（traces + trace_spans + 索引）
 │   └── backends/
 │       └── sqlite.py        # SQLiteBackend（默认实现，WAL + 单连接）
 ├── tools/
-│   └── tui.py               # 运营工具：树状可视化（import astrolabe + rich）
+│   └── tui.py               # 旧参数兼容入口，委托 astrolabe.cli
 └── tests/                   # pytest：api / collector / span_stack / sqlite_backend / tui
 ```
 
 **包与运营工具的边界**：`src/astrolabe/` 是会被其他项目安装的核心库
-（`uv add astrolabe --path ...`），只含运行时；`tools/` 是仓库自带的运营
-工具，通过 `import astrolabe` 消费核心，不进安装包（rich 在 dev 组）。
+（`uv add astrolabe --path ...`），含运行时与零依赖 CLI；`tools/` 是仓库自带的运营
+工具，通过 `import astrolabe` 消费核心，不进安装包。查询和展示均委托 CLI。
 
 ## 常用命令
 
 ```bash
 cd ~/Documents/project/astrolabe
-uv sync                      # 安装 dev 依赖（pytest + rich）
-uv run python -m pytest      # 全量测试（当前 50 个）
+uv sync                      # 安装 dev 依赖（pytest）
+uv run python -m pytest      # 全量测试
 uv run python -m pytest tests/test_span_stack.py -v   # 单文件
 
 # TUI（运营工具，仓库自带）：渲染指定 trace 的树 / 列出最近 trace
 uv run python tools/tui.py --db <db路径> --trace <TRACE_ID>
 uv run python tools/tui.py --db <db路径> --list
+
+# 随安装包的只读 CLI
+uv run astrolabe --db <db路径> list --limit 20
+uv run astrolabe --db <db路径> show --latest 5
+uv run astrolabe --db <db路径> show <TRACE_ID> --details
+uv run astrolabe --db <db路径> stats
 ```
 
 宿主集成：
@@ -78,23 +92,20 @@ uv add astrolabe --path ~/Documents/project/astrolabe
 2. **span 的 created_at 记录 start 时间**（`_SpanState.started_at_iso`），不是
    flush 时间。父先 start 天然有序，`ORDER BY created_at` 即树序；flush 时
    统一时间戳会导致子先父后（内层先 finish 进 pending）。
-3. **span 栈 copy-on-write**：`_push` 新建 list 再 set。asyncio Task 的
-   `copy_context()` 浅拷贝 var 值，若直接 append 共享 list，并发任务会串栈。
-4. **build_span_tree 的 nest() 必须拷贝子节点**（`nest(dict(c))`）——不拷贝
-   则子节点是原始引用，缺少 children 键。
+3. **span 栈按 collector 隔离**：每个 collector 拥有 ContextVar[tuple]，
+   进入 span 新建 tuple，退出用 token.reset。不要恢复成共享可变 list。
+4. **树构建用 tree.py 的纯函数**：拷贝节点，迭代连接 children；不依赖
+   Python 递归深度。子树筛选保持输入的开始时间顺序。
 5. **SQLite 单连接 + WAL + check_same_thread=False**：一个 Astrolabe 实例
-   共享一个连接，跨线程可用但写并发由 SQLite 锁串行化。
+   共享一个连接，RLock 串行化完整批次事务和查询，不只锁单条 SQL。
 6. **stats 的 by_hops 用 `json_extract(metadata,'$.hop_count')`**：宿主未设置
    该字段的 trace 不出现（`IS NOT NULL` 过滤）——通用库不允许假设宿主有
    "轮数"概念。
 7. **新增 span 类型（operation 名）不需要改 schema**：operation 是自由字符串，
    `tool.xxx` 前缀约定区分类型，细节全在 metadata。
-8. **ambient span 与 collector.span 走同一解析路径**：`_start` 内
-   `parent_id is _UNSET` 时调 `_stack_top_or_root()`。**例外：collector 的
-   第一个 span（root_span_id 未设）强制 parent=None，绝不挂外层系统的栈**
-   ——嵌套 atrace（下游系统入口在外层 trace 内）若挂外层栈顶会串树，
-   flush 沿父链越界 KeyError（v0.3 踩过）。
-9. **`_resolve_trace_id` 区分主根与独立根**：主根（== root_span_id）用全局
+8. **ambient、同步、异步 span 共用生命周期**：aspan 包装 span；atrace
+   包装 trace。各 collector 栈天然隔离，首个 span 不会挂外系统的栈。
+9. **trace_id 在创建 span 时确定**：主根（== root_span_id）用全局
    `self.global_trace_id`；显式 `parent_id=None` 开的独立 trace 用自身 span_id——
    否则多个独立根物化到同一 (trace_id, host) 行互相 REPLACE。
 10. **悬空显式 parent_id 降级为独立根**：`_start` 校验显式 parent_id 是否在
@@ -103,6 +114,13 @@ uv add astrolabe --path ~/Documents/project/astrolabe
 11. **数值过滤参数归一化**：`_norm_value` 对 gt/gte/lt/lte 的字符串值做
     int/float 归一化——SQLite 类型排序 INTEGER < TEXT，字符串绑定值会静默
     匹配不到任何数值（HTTP query 参数天然是字符串，曾静默返回空集）。
+12. **span 退出捕获 BaseException 后原样重抛**：取消/中断也必须结束 span。
+    trace 退出先 close collector，未完成子 span 标记 IncompleteSpan；关闭后
+    继承上下文的后台任务埋点 no-op，旧 handle 不再修改已结束 span。
+13. **metadata 捕获时快照**：不支持对象和循环记入 `_astrolabe` 诊断；
+    只快照新输入值，诊断与宿主属性分开管理。结束后拒绝属性修改，持久化前
+    用 CaptureLimits 统一限幅并缓存封存记录；重试不再处理 metadata。
+    不要直接保存宿主对象引用，也不要对库诊断应用宿主字符串限制。
 
 ## 开发约定
 
@@ -118,7 +136,7 @@ uv add astrolabe --path ~/Documents/project/astrolabe
 
 1. 核心库零依赖是卖点——新功能若需第三方库，放 optional extra 或独立模块。
 2. 埋点 API 的语义：宿主只接触 `Astrolabe` / `span` / `aspan` /
-   `set_attrs`。`_start`/`_finish`/`flush`/`_patch_attrs` 是内部实现，
-   业务代码不该直接调用（`trace`/`atrace` 入口代管 flush）。
+   `set_attrs`。`_start`/`_finish`/`_patch_attrs` 是内部实现；`flush` 仅供显式重试，
+   业务入口的正常采集由 `trace`/`atrace` 代管 close/flush。
 3. TUI 验证用真实 db：先造 trace 再 `uv run python tools/tui.py --trace <id>`。
 4. 修改后全量跑 `uv run python -m pytest` 再交付。

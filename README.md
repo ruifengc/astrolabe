@@ -1,204 +1,249 @@
 # Astrolabe 星盘
 
-记录 AI 行为路径的可观测库。低侵入接入 agent / LLM 系统：记录每次请求的
-推理链路（LLM 决策、工具调用、耗时、状态），写入本地 SQLite，支持嵌套
-span 树查询与聚合指标。
+记录 AI 请求的执行路径：模型调用、工具调用、耗时、异常和宿主提供的内容。
+用 `trace/atrace` 包住请求入口，在业务步骤中加 `span/aspan`，自动生成调用树，
+请求结束后写入本地 SQLite。核心和随包安装的 CLI 都只有标准库依赖。
 
-- **零运行时依赖**：仅标准库（sqlite3 / contextvars / contextlib）
-- **双上下文管理器**：`span()`（同步）+ `aspan()`（异步），共享同一内核
-- **透明降级**：未安装 collector 时埋点代码自动 no-op，宿主行为零影响
-- **存储可插拔**：`StorageBackend` 接口抽象，默认 SQLite 实现，可自定义
-
-## 安装
+## 安装与接入
 
 ```bash
 uv add astrolabe --path ~/Documents/project/astrolabe
-# 或 pip install -e ~/Documents/project/astrolabe
 ```
-
-## 快速开始
 
 ```python
 from astrolabe import Astrolabe, aspan
 
-a = Astrolabe("~/.astrolabe/astrolabe.db")   # 默认路径，可省略
+observability = Astrolabe("./data/traces.db")
 
 async def ask(question):
-    # 入口：创建 collector + 根 span，退出时自动 flush
-    async with a.atrace("ask", host="my-agent", question=question):
-        # operation 名与 attrs 键都由宿主自定义，原样进 span 的 metadata JSON
-        async with aspan("llm.chat", model="deepseek-v4") as h:
-            msg = await llm.chat(messages)
-            h.set_attrs(llm_content=msg)
+    async with observability.atrace(
+        "ask", host="my-agent", question=question,
+    ) as request:
+        async with aspan("llm.chat", model="my-model") as call:
+            response = await llm.chat(question)
+            call.set_attrs(content=response)
 
-        async with aspan("tool.search", tool_args={"q": question}):
-            result = await executor.search(question)
+        async with aspan("tool.search", tool_args={"q": question}) as tool:
+            results = await search(question)
+            tool.set_attrs(result_count=len(results))
+
+        request.set_root_attrs(answer=response)
+        return response
 ```
 
-> 示例里的 `"llm.chat"`、`model`、`tool_args` 只是演示：astrolabe 不预定义
-> 任何业务字段，operation 名和 metadata 键完全由宿主自己约定
-> （`tool.xxx` 前缀、hop_number 这类领域字段都是宿主侧概念）。
+同步代码使用 `with observability.trace(...)` 和 `with span(...)`。
+一个应用共享一个 Astrolabe 实例；关闭应用时调用 `observability.close()`，
+也可以用 `with Astrolabe(...) as observability` 管理连接。
 
-同步宿主用 `a.trace(...)` + `span(...)`：
+operation 和 metadata 的字段名都由宿主定义，无需修改表结构。
+未激活请求时，模块级 `span/aspan` 和 `set_attrs` 自动 no-op。
+Astrolabe 保存宿主埋点提供的数据；没有埋点的调用和模型未返回的内部推理不会自动捕获。
+
+## 运维 CLI：看一次或几次 AI 调用
+
+安装库后即可运行 `astrolabe`，也支持 `python -m astrolabe`。
+使用 uv 的项目在命令前加 `uv run`。CLI **只读打开已有数据库**，不创建数据库、
+不执行 schema 初始化。默认路径是 `~/.astrolabe/astrolabe.db`。
+`--db` 和 `--json` 可以放在子命令前或后。
+
+```bash
+# 最近请求：id、系统、状态、耗时、时间和问题摘要
+uv run astrolabe --db ./data/traces.db list --limit 20
+
+# 最近一次 / 最近五次请求的调用树
+uv run astrolabe --db ./data/traces.db show
+uv run astrolabe --db ./data/traces.db show --latest 5
+
+# 指定请求；同一 trace 多个系统时，每个系统各显示一棵树
+uv run astrolabe --db ./data/traces.db show TRACE_ID
+
+# 按系统或失败状态筛选
+uv run astrolabe show --latest 5 --host knowledge-news-mcp --status failed
+
+# 按任意 metadata 字段筛选；多个条件取交集
+uv run astrolabe list --filter 'question__contains=RAG' --filter 'hop_count__gte=2'
+
+# 所有节点的完整 metadata；或只查看某个节点
+uv run astrolabe show TRACE_ID --host knowledge-news-mcp --details
+uv run astrolabe span TRACE_ID SPAN_ID
+
+# 请求统计、每种 operation 的次数和耗时
+uv run astrolabe stats --host knowledge-news-mcp
+uv run astrolabe stats --operation tool.search
+
+# JSON 导出，便于进一步分析；show 导出摘要和按时间排序的扁平 span
+uv run astrolabe show TRACE_ID --json
+```
+
+树的输出包含嵌套关系、operation、状态、总耗时、相对请求开始的时间、span id，
+以及模型、token 用量、工具结果数量等已记录的 metadata 摘要。例如：
+
+```text
+trace=...  host=demo  done  42ms  ...
+4 spans  recorded tokens: input=120 output=32
+question: 最近有哪些新闻？
+ask [ok] 42ms +0ms id=...
+└── hop [ok] 42ms +0ms id=... hop_number=1
+    ├── llm.chat [ok] 20ms +0ms id=... model=demo
+    └── tool.search [ok] 21ms +20ms id=... result_count=2
+```
+
+父节点耗时包含子节点；并发节点的耗时不能直接相加。
+显示的 token 用量只汇总节点上已记录的 `llm_prompt_tokens/llm_completion_tokens`，
+不是模型计费接口的数据。`--details` 和 `span` 用于查看工具参数、响应内容、异常和采集诊断。
+
+不连接真实模型也能试用，示例中的数据明确标记为模拟调用：
+
+```bash
+uv run python examples/demo.py --db /tmp/astrolabe-demo.db
+uv run astrolabe --db /tmp/astrolabe-demo.db show --latest 3
+uv run astrolabe --db /tmp/astrolabe-demo.db stats
+```
+
+旧 `tools/tui.py` 命令保留为兼容入口，参数转换后直接调用同一个 CLI；
+树展示、metadata 摘要和只读查询只有一套实现，无需 Rich：
+
+```bash
+uv sync
+uv run python tools/tui.py --db /tmp/astrolabe-demo.db --list
+uv run python tools/tui.py --db /tmp/astrolabe-demo.db --trace TRACE_ID --host demo
+```
+
+## 请求生命周期与可靠性
+
+- 每个 collector 有独立的 contextvar span 栈，保存不可变 tuple，以 token 恢复。
+  嵌套系统不会共享栈；并发 asyncio Task 自动继承父节点，之后各自维护栈。
+- 不传 `parent_id` 自动挂当前父节点；显式传入覆盖父节点；`parent_id=None` 开独立 trace。
+  悬空显式 parent 降级为独立 trace，并记录 `_dangling_parent`。
+- span 创建时确定所属 trace id、记录开始时间。`set_attrs` 拷贝传入数据，
+  span 结束后冻结，后续修改原字典或使用旧 handle 都不会改变记录。
+- collector 生命周期为 `active → closing → closed`。入口退出时封存采集并 flush；
+  尚未结束的子 span 以 `error/IncompleteSpan` 收尾，根 metadata 标记 `unfinished_spans`。
+  请求结束后，继承旧上下文的后台任务继续正常工作，埋点自动 no-op。
+  **要完整记录并发工作，请在 trace 范围内 await/gather 它们。**
+- 普通异常、异步取消、KeyboardInterrupt/SystemExit 都结束 span，再原样传播。
+  请求摘要状态为 `done/failed`，span 状态为 `ok/error`。
+- SQLite 预先序列化批次，以完整事务写入两张表；失败回滚，不遗留给下一次请求。
+  共享连接用 RLock 覆盖整次事务和查询。span 写入按 id 幂等，批次可以安全重试。
+  同一 `(trace_id, host)` 只允许相同根 span 重试；不同根冲突时整批拒绝并记日志，
+  保留已有请求，不覆盖摘要或留下新 span。
+- 入口捕获持久化异常并记日志，始终恢复 collector 上下文，不覆盖宿主异常。
+  无自动重试队列；需要重试时，可保留 collector 并显式 `flush()`。
+- SQLite flush 仍同步执行；这是轻量本地存储的取舍，数据库繁忙时会等待 SQLite 锁。
+
+## Metadata 快照、容错与限制
+
+支持 JSON 类型和 tuple（存为列表）。不支持的对象、非有限浮点数、循环引用、
+超过 64 层的 metadata 会被替换/跳过，并在保留键 `_astrolabe.metadata_issues`
+中记录字段路径；不会调用任意对象的 repr/str/deepcopy，也不会拖垮整条请求。
+`_astrolabe` 是库的诊断命名空间；宿主传入该顶层键时会跳过并记诊断。
+输入和 `set_attrs` 只拷贝本次提供的新值；span 结束后不接受属性修改，
+持久化前统一执行限幅并封存记录，重试直接使用已封存的 metadata。
+库诊断单独管理，字符串限制只处理宿主值，保留原始问题路径。
+
+可选限制默认为关闭：
 
 ```python
-from astrolabe import Astrolabe, span
+from astrolabe import Astrolabe, CaptureLimits
 
-a = Astrolabe()
-with a.trace("job", host="cron", name="nightly"):
-    with span("step1"):
-        ...
+observability = Astrolabe(
+    "./data/traces.db",
+    limits=CaptureLimits(
+        max_spans=2000,             # 每个 collector，含根；超出后的 span no-op
+        max_string_length=16000,    # 单个宿主字符串最多保存的字符数
+        max_metadata_bytes=64000,  # 每个 span 的 metadata JSON 字节上限，至少 128
+    ),
+)
 ```
 
-> 埋点代码在未激活 tracing 的环境（如测试）里是透明 no-op——不报错、不丢行为，
-> 只是不记录。要激活 tracing 只需在入口使用 `trace`/`atrace`。
+字符串截断会记诊断；metadata 超限时优先移除大字段，保留小字段并标记截断。
+span 超限时，根 metadata 记录 `dropped_spans`。
+`max_spans × max_metadata_bytes` 限制一个 collector 的 span metadata 总体积；
+数据库还会包含骨架字段、索引及根摘要副本，不等于数据库文件大小上限。
+设定限制作用于持久化记录，不是采集期间的内存上限。
+字节限制很小时，完整诊断路径可能压缩为诊断数量；采集截断仍会标记。
 
-### 跨系统链路：共享 trace_id
-
-一条请求可能跨多个系统（如 Hermes → knowledge-news）。每个系统只记录自己的
-span（各自独立 db 文件），但共享同一个全局 trace_id：
+## 跨系统传播与查询
 
 ```python
-# 系统 A（第一跳）：自动生成全局 trace_id
-async with a.atrace("ask", host="my-agent", question=q) as ca:
-    async with aspan("retrieve", limit=10):
-        ...
-    # 调下游前导出传播上下文，随请求带过去（HTTP header / MCP 参数）
-    ctx = get_trace_context()      # {"trace_id": "2e5f...", "host": "my-agent"}
+from astrolabe import get_trace_context
 
-# 系统 B（下游）：接收上游 trace_id，沿用同一链路
-async with b.atrace("ask", host="knowledge-news", trace_id=ctx["trace_id"]):
-    async with aspan("tool.search"):
-        ...
+# 上游：在活跃 trace 内读取，随 HTTP header / MCP 参数传给下游
+context = get_trace_context()  # {"trace_id": ..., "host": ...} 或 None
+
+# 下游：沿用全局 id，自建本系统根节点
+async with downstream.atrace("ask", host="downstream", trace_id=context["trace_id"]):
+    ...
 ```
 
-- 首跳不传 `trace_id` → 自动生成；下游传上游的 → 沿用
-- `trace_id` 与本地根 span id 解耦：`collector.global_trace_id`（全局）≠ `collector.root_span_id`（本系统根）
-- `traces` 表按 `(trace_id, host)` 复合主键——同一链路各系统各一行，互不覆盖；
-  查询 API 支持 `host=` 参数只看某个系统的子树（get_trace/get_trace_spans/build_span_tree）
-- 查询聚合工具（跨多 db / 多 host 合并视图）在 MCP server / Web UI 里程碑实现
-
-### Span 栈：零参数自动挂载
-
-Astrolabe 维护一个 per-task 的 span 栈（contextvar）：进入 span 时压栈，
-退出时弹栈，新 span 自动挂到栈顶。**嵌套埋点不需要传任何 id**：
+每个系统可写自己的 db，共享 trace id 与本系统 root span id 是两个概念。
+同一 db 内 `(trace_id, host)` 是摘要复合主键，每系统一行。
+同一 host 的同一 trace id 只属于一个本地根 span；相同根的批次可以幂等重试，
+新建不同根不能替换已有请求。每次独立请求生成新的 trace id；同一请求内的
+多次操作用子 span 记录。
 
 ```python
-async with aspan("step1"):             # 挂到根
-    async with aspan("tool.search"):   # 自动挂到 step1
-        ...
+observability.list_traces(host="my-agent", filters={"question__contains": "RAG"})
+observability.count_traces(host="my-agent", filters={"question__contains": "RAG"})
+observability.get_trace(trace_id, host="my-agent")
+observability.get_trace_spans(trace_id, host="my-agent")  # 按开始时间排序
+observability.build_span_tree(trace_id, host="my-agent") # {trace, tree}
+observability.build_span_trees(trace_id)                  # 多系统：[{trace, tree}, ...]
+observability.get_traces(trace_id)                        # 所有系统摘要
+observability.stats(host="my-agent")
+observability.operation_stats(operation="my-step")       # 通用 operation 指标
 ```
 
-- `parent_id` 显式传入时优先于栈（用于跨任务挂载等特殊场景）
-- `parent_id=None` 显式传时开启一条**独立的新 trace**
-- 并发 asyncio 任务各自持有独立栈（copy-on-write，互不串扰）
+`host=None`（默认）表示未指定系统；`host=""` 精确选择空 host。
+`get_trace/build_span_tree` 在多个 host 时要求显式指定 host，以免混配摘要和树。
+`get_trace_spans` 不指定 host 时仍返回全局 id 下所有 span。
+CLI 的 `show TRACE_ID` 自动使用多树查询。
 
-## 查询
+metadata 过滤语法为 `jsonpath__op`：`eq/contains/gt/gte/lt/lte`。
+`contains` 匹配字面子串（`%/_` 不作为通配符），数值比较支持数字字符串和科学计数法。
+`stats.operations` / `operation_stats` 不要求宿主采用特定名字；
+`stats.by_hops` 和 `stats.tool_stats` 保留为原有 hop_count/tool.* 约定的兼容视图。
 
-```python
-a.list_traces(host="my-agent", status="done")          # 列表（最新在前）
-a.list_traces(filters={"question__contains": "RAG"})   # metadata JSON 字段过滤
-a.get_trace(trace_id)                                   # 单条
-a.get_trace_spans(trace_id)                             # 扁平 span 列表
-a.build_span_tree(trace_id)                             # 嵌套树 {trace, tree}
-a.stats()                                               # 聚合指标
-```
+## 数据模型与后端
 
-过滤器语法 `jsonpath__op`：`eq` / `contains` / `gt` / `gte` / `lt` / `lte`。
-
-## 数据模型
-
-```
-traces:      trace_id, host, status(done|failed), duration_ms,
+```text
+traces:      trace_id, host, root_span_id, status, duration_ms,
              error, metadata(JSON), created_at, updated_at
              PRIMARY KEY (trace_id, host)
 trace_spans: span_id, trace_id, parent_span_id, operation, duration_ms,
-             status(ok|error), metadata(JSON), created_at
+             status, metadata(JSON), created_at
 ```
 
-- `trace_id` 是跨系统共享的全局 id（首跳生成、下游沿用），与根 span 的
-  `span_id` 解耦；复合主键 `(trace_id, host)` 保证同一链路各系统互不覆盖
-- 宿主特定字段（question、mode、hop_count、citations 等）全部放 `metadata` JSON——
-  无需配置、无需迁移，`json_extract` 即可过滤查询。schema 列只保留跨宿主通用的骨架。
+列表/聚合读摘要表，详情读 span 表，通过 parent 指针还原树。
+宿主字段始终进 metadata，本次更新无 schema 变更。
+树构建和子树选择是可复用的标准库纯函数，支持超过 Python 递归限制的树深度。
 
-## 工作原理
+自定义存储通过 `StorageBackend` 接入，写入核心契约是
+`write_batch(traces, spans)`：原子提交、失败回滚、批次并发隔离、重试幂等。
+查询返回普通 dict，metadata 已解码；树构建有默认实现可复用。
+存储接口只有一个写入口；不要求自定义后端实现逐条插入和手动 commit。
+冲突检查与写入处于同一事务，来自不同连接的竞争也遵循相同规则。
 
-一次请求的数据流：
+### 0.4 升级说明
 
-```
-atrace()/trace() 入口                    宿主业务代码
-┌──────────────────┐   ┌───────────────────────────────────────┐
-│ 创建 SpanCollector │   │ async with aspan("step1"):            │
-│ 设置 contextvar   │──▶│   async with aspan("tool.search"):     │
-│ 开根 span         │   │     ...  ← 自动挂栈顶，零参数          │
-└──────────────────┘   └───────────────────────────────────────┘
-                              │ 退出入口时 flush()
-                              ▼
-                    ┌─────────────────────┐
-                    │ 根 span → traces    │  ← 物化摘要（窄表）
-                    │ 所有 span → trace_spans │  ← 完整树（全量）
-                    └─────────────────────┘
-                              │
-                    查询：list_traces / stats 走 traces 窄表
-                          build_span_tree 从 trace_spans 重建树
-```
+- 0.3 的现有数据库直接使用，无需迁移。
+- 原有 `trace/atrace/span/aspan/set_attrs` 和新闻库埋点方式继续使用。
+- 查询的空 host 现在表示精确过滤，未指定请省略或传 None。
+- 多 host 的单树查询会提示消歧；调用 `build_span_trees` 可显式读取全部系统。
+- 自定义后端需要实现新增的批次/多摘要/通用指标接口，并支持新增查询过滤参数。
+- 原有逐条写入/commit 接口已移除，自定义后端只需实现批次写入契约。
+- 旧 TUI 参数保持兼容，输出统一使用 CLI 的标准库树展示。
+- span 结束后的属性更新变为 no-op；后台任务应在请求范围内等待完成。
+- 固定 Git revision 的宿主需要更新依赖 revision，才会使用此版本和 CLI。
 
-- **写入时编码层级**：每个 span 创建瞬间就从 span 栈确定 `parent_span_id`，
-  树结构在数据里是完整的——查询阶段只是按指针机械还原，无任何推断。
-- **flush 由入口代管**：`trace`/`atrace` 退出时自动 flush 全部已结束 span；
-  业务代码不接触持久化。
-- **状态映射**：flush 时根 span `ok→done`、`error→failed` 写入 traces；
-  trace_spans 保留 `ok/error` 原值。
-
-## 设计决策
-
-| 决策 | 理由 |
-|------|------|
-| 两表（traces + trace_spans） | 列表/聚合走窄表 traces，详情钻取走全量 trace_spans；root span 物化是 OTel 同款模式 |
-| 宿主字段全进 metadata JSON | 零配置零迁移；新字段不需要改 schema；`json_extract` 查询兜底 |
-| span 栈自动挂载 | 嵌套埋点零参数；contextvar per-task 隔离，并发安全（copy-on-write） |
-| 同步/异步双上下文管理器 | 同一内核，sync/async 宿主各取所需 |
-| StorageBackend 接口抽象 | 换后端（Postgres/远程）不动 collector 和门面 |
-| 透明 no-op | 无 collector 时埋点代码可运行，测试环境零负担 |
-| 核心零依赖 | `pip install astrolabe` 即可接入，不拖任何第三方包 |
-| 跨系统共享 trace_id + (trace_id, host) 复合主键 | 每系统独立记录自己的 span（独立 db），链路全局可聚合；复合主键防覆盖 |
-
-## TUI 树状可视化（运营工具）
-
-TUI 是仓库自带的**运营工具**，不属于被安装的核心库（核心包只含运行时）。
-它像任何外部使用者一样通过 `import astrolabe` 消费库，运行在仓库环境
-（rich 是 dev 依赖）：
+## 开发
 
 ```bash
-# 渲染指定 trace 的树状结构
-uv run python tools/tui.py --db <db路径> --trace <TRACE_ID>
-
-# 列出最近 trace 方便找 id
-uv run python tools/tui.py --db <db路径> --list
+uv sync
+uv run python -m pytest
 ```
 
-输出：操作名 + 耗时 + 状态（ok/error 着色）+ metadata 摘要（宿主自定义键，如模型、结果数、工具参数）。
+`src/astrolabe/` 是安装包（含标准库 CLI）；`tools/` 是仓库运营工具，不打包。
+测试只使用临时文件或内存数据库，不写操作者默认追踪库。
 
-## 项目结构
-
-```
-src/astrolabe/
-├── api.py        # Astrolabe 门面（trace/atrace 入口 + 查询委托）
-├── collector.py  # SpanCollector 内核 + span/aspan 双上下文管理器 + span 栈
-├── context.py    # contextvars 传播
-├── storage.py    # StorageBackend 抽象接口
-├── backends/
-│   └── sqlite.py # SQLiteBackend（默认实现）
-└── schema.py     # DDL
-tools/
-└── tui.py        # 运营工具：树状可视化（不在安装包里，依赖 rich）
-```
-
-## 路线图
-
-- [x] v0.1 核心：span 采集 + SQLite 存储 + 查询/聚合 API
-- [x] v0.2 span 栈自动挂载 + 宿主字段通用化（metadata JSON）
-- [x] v0.3 跨系统传播：共享 trace_id + (trace_id, host) 复合主键 + get_trace_context
-- [ ] LLM 代理捕获：OpenAI 兼容 HTTP 代理，LLM 调用零代码自动记录
-- [ ] MCP server：把查询能力暴露为 MCP 工具（含多来源聚合查询）
-- [ ] Web UI：时间线可视化
+后续方向：OpenAI 兼容代理捕获、MCP 查询接口、多数据库链路聚合、Web 时间线。

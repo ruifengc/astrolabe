@@ -15,17 +15,24 @@ def backend(tmp_path):
 
 
 def _mk_trace(b, trace_id, *, host="app", status="done",
-              duration_ms=100, metadata=None, created_at="2026-01-01T00:00:00+00:00"):
-    b.upsert_trace(
-        trace_id, host=host, root_span_id="root-" + trace_id,
+              duration_ms=100, metadata=None, created_at="2026-01-01T00:00:00+00:00",
+              root_span_id=None):
+    b.write_batch([dict(
+        trace_id=trace_id, host=host, root_span_id=root_span_id or "root-" + trace_id,
         status=status,
         duration_ms=duration_ms, error="",
         metadata=metadata or {"question": "q" + trace_id},
         created_at=created_at, updated_at=created_at,
-    )
+    )], [])
 
 
-def test_upsert_and_get_trace(backend):
+def _span(span_id, trace_id, parent_span_id, operation, duration_ms, status, metadata, created_at):
+    return dict(span_id=span_id, trace_id=trace_id, parent_span_id=parent_span_id,
+                operation=operation, duration_ms=duration_ms, status=status,
+                metadata=metadata, created_at=created_at)
+
+
+def test_batch_and_get_trace(backend):
     _mk_trace(backend, "t1", metadata={"question": "你好", "mode": "sync"})
     row = backend.get_trace("t1")
     assert row is not None
@@ -35,7 +42,7 @@ def test_upsert_and_get_trace(backend):
     assert row["metadata"] == {"question": "你好", "mode": "sync"}  # decoded
 
 
-def test_upsert_replaces(backend):
+def test_batch_retry_updates_same_root(backend):
     _mk_trace(backend, "t1", metadata={"hop_count": 1})
     _mk_trace(backend, "t1", metadata={"hop_count": 5})
     assert backend.count_traces() == 1
@@ -43,12 +50,11 @@ def test_upsert_replaces(backend):
 
 
 def test_insert_and_get_spans(backend):
-    _mk_trace(backend, "t1")
-    backend.insert_span("s1", "t1", None, "ask", 50, "ok",
-                        {"question": "q"}, "2026-01-01T00:00:00+00:00")
-    backend.insert_span("s2", "t1", "s1", "tool.search", 10, "ok",
-                        {"result_count": 3}, "2026-01-01T00:00:01+00:00")
-    backend.commit()
+    _mk_trace(backend, "t1", root_span_id="s1")
+    backend.write_batch([], [
+        _span("s1", "t1", None, "ask", 50, "ok", {"question": "q"}, "2026-01-01T00:00:00+00:00"),
+        _span("s2", "t1", "s1", "tool.search", 10, "ok", {"result_count": 3}, "2026-01-01T00:00:01+00:00"),
+    ])
     spans = backend.get_trace_spans("t1")
     assert [s["span_id"] for s in spans] == ["s1", "s2"]
     assert spans[1]["metadata"] == {"result_count": 3}
@@ -109,12 +115,13 @@ def test_numeric_filter_string_values(backend):
 
 
 def test_build_span_tree(backend):
-    _mk_trace(backend, "t1")
-    backend.insert_span("root", "t1", None, "ask", 50, "ok", {}, "2026-01-01T00:00:00+00:00")
-    backend.insert_span("h1", "t1", "root", "hop", 40, "ok", {"hop_number": 1}, "2026-01-01T00:00:01+00:00")
-    backend.insert_span("tool1", "t1", "h1", "tool.search", 5, "ok", {}, "2026-01-01T00:00:02+00:00")
-    backend.insert_span("tool2", "t1", "h1", "tool.get_article", 5, "error", {}, "2026-01-01T00:00:03+00:00")
-    backend.commit()
+    _mk_trace(backend, "t1", root_span_id="root")
+    backend.write_batch([], [
+        _span("root", "t1", None, "ask", 50, "ok", {}, "2026-01-01T00:00:00+00:00"),
+        _span("h1", "t1", "root", "hop", 40, "ok", {"hop_number": 1}, "2026-01-01T00:00:01+00:00"),
+        _span("tool1", "t1", "h1", "tool.search", 5, "ok", {}, "2026-01-01T00:00:02+00:00"),
+        _span("tool2", "t1", "h1", "tool.get_article", 5, "error", {}, "2026-01-01T00:00:03+00:00"),
+    ])
 
     tree = backend.build_span_tree("t1")
     assert tree is not None
@@ -138,10 +145,11 @@ def test_stats(backend):
                   duration_ms=100 + i * 50, metadata={"hop_count": 2})
     _mk_trace(backend, "tf", status="failed", duration_ms=10)
     _mk_trace(backend, "tno", status="done", duration_ms=30)  # no hop_count
-    backend.insert_span("s1", "t0", None, "tool.search", 20, "ok", {}, "2026-01-01T00:00:00+00:00")
-    backend.insert_span("s2", "t1", None, "tool.search", 40, "ok", {}, "2026-01-01T00:00:00+00:00")
-    backend.insert_span("s3", "t2", None, "tool.web_search", 90, "ok", {}, "2026-01-01T00:00:00+00:00")
-    backend.commit()
+    backend.write_batch([], [
+        _span("s1", "t0", None, "tool.search", 20, "ok", {}, "2026-01-01T00:00:00+00:00"),
+        _span("s2", "t1", None, "tool.search", 40, "ok", {}, "2026-01-01T00:00:00+00:00"),
+        _span("s3", "t2", None, "tool.web_search", 90, "ok", {}, "2026-01-01T00:00:00+00:00"),
+    ])
 
     s = backend.stats()
     assert s["overall"]["total"] == 4          # 3 done with hop + 1 done without

@@ -75,19 +75,18 @@ def test_same_trace_id_two_hosts_coexist(tmp_path):
         a.close()
 
 
-def test_upsert_idempotent_per_host(tmp_path):
+def test_batch_idempotent_per_host(tmp_path):
     """Re-flushing the same (trace_id, host) replaces, never duplicates."""
     b = SQLiteBackend(str(tmp_path / "t.db"))
     try:
         for _ in range(2):
-            b.upsert_trace(
-                "shared12345678", host="alpha", root_span_id="root123",
+            b.write_batch([dict(
+                trace_id="shared12345678", host="alpha", root_span_id="root123",
                 status="done",
                 duration_ms=10, error="", metadata={"hop_count": 1},
                 created_at="2026-01-01T00:00:00+00:00",
                 updated_at="2026-01-01T00:00:00+00:00",
-            )
-            b.commit()
+            )], [])
         assert b.count_traces() == 1
         assert b.get_trace("shared12345678")["metadata"]["hop_count"] == 1
         assert b.get_trace("shared12345678")["root_span_id"] == "root123"

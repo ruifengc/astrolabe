@@ -1,246 +1,238 @@
-"""SQLite implementation of StorageBackend."""
+"""SQLite storage: atomic batches, a shared connection lock, read-only inspection."""
 
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+from functools import wraps
 from pathlib import Path
+from threading import RLock
 
 from ..schema import SCHEMA
 from ..storage import StorageBackend
+from ..tree import subtree
 
-# Filter operators supported on metadata JSON values (jsonpath__op → value).
-_OPS = {
-    "eq": "= ?",
-    "contains": "LIKE ?",
-    "gt": "> ?",
-    "gte": ">= ?",
-    "lt": "< ?",
-    "lte": "<= ?",
-}
+_OPS = {"eq": "= ?", "contains": "LIKE ? ESCAPE '\\'", "gt": "> ?",
+        "gte": ">= ?", "lt": "< ?", "lte": "<= ?"}
+_TRACE_SQL = """INSERT INTO traces(trace_id, host, root_span_id, status,
+    duration_ms, error, metadata, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(trace_id, host) DO UPDATE SET root_span_id=excluded.root_span_id,
+    status=excluded.status, duration_ms=excluded.duration_ms, error=excluded.error,
+    metadata=excluded.metadata, created_at=excluded.created_at, updated_at=excluded.updated_at"""
+_SPAN_SQL = """INSERT INTO trace_spans(span_id, trace_id, parent_span_id, operation,
+    duration_ms, status, metadata, created_at) VALUES(?,?,?,?,?,?,?,?)
+    ON CONFLICT(span_id) DO UPDATE SET trace_id=excluded.trace_id,
+    parent_span_id=excluded.parent_span_id, operation=excluded.operation,
+    duration_ms=excluded.duration_ms, status=excluded.status,
+    metadata=excluded.metadata, created_at=excluded.created_at"""
 
 
-def _norm_value(op: str, v) -> object:
+def _locked(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
+def _norm_value(op: str, value):
     if op == "contains":
-        return f"%{v}%"
-    if op in ("gt", "gte", "lt", "lte") and isinstance(v, str):
-        # json_extract returns INTEGER/REAL/TEXT; a string-bound value would
-        # sort after all numbers (SQLite type order) and silently match
-        # nothing. Coerce numeric-looking strings so HTTP query params work.
-        s = v.strip()
+        # contains means literal substring, including '%' and '_'.
+        escaped = str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{escaped}%"
+    if op in ("gt", "gte", "lt", "lte") and isinstance(value, str):
         try:
-            if s.lstrip("+-").isdigit():
-                return int(s)
-            if s.replace(".", "", 1).lstrip("+-").isdigit():
-                return float(s)
+            return int(value.strip())
         except ValueError:
-            pass
-    return v
+            try:
+                numeric = float(value.strip())
+                if math.isfinite(numeric):
+                    return numeric
+            except ValueError:
+                pass
+    return value
+
+
+def _trace_values(trace):
+    return tuple(trace[k] for k in ("trace_id", "host", "root_span_id", "status",
+                                   "duration_ms", "error")) + (
+        json.dumps(trace["metadata"], allow_nan=False), trace["created_at"], trace["updated_at"])
+
+
+def _span_values(span):
+    return tuple(span[k] for k in ("span_id", "trace_id", "parent_span_id", "operation",
+                                  "duration_ms", "status")) + (
+        json.dumps(span["metadata"], allow_nan=False), span["created_at"])
 
 
 class SQLiteBackend(StorageBackend):
-    """SQLite-backed storage. One connection, WAL mode, schema auto-created."""
-
-    def __init__(self, path: str = "~/.astrolabe/astrolabe.db"):
-        path = str(Path(path).expanduser())
-        parent = Path(path).parent
-        if str(parent) not in (".", ""):
-            parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+    def __init__(self, path: str = "~/.astrolabe/astrolabe.db", *, readonly: bool = False):
+        self._lock = RLock()
+        self.readonly = readonly
+        self.path = str(Path(path).expanduser())
+        if readonly:
+            # mode=ro never creates missing files or runs DDL/changes WAL mode.
+            uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        else:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        try:
+            if readonly:
+                self.conn.execute("PRAGMA query_only=ON")
+            else:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.executescript(SCHEMA)
+                self.conn.commit()
+        except BaseException:
+            self.conn.close()
+            raise
 
+    @_locked
     def close(self) -> None:
         self.conn.close()
 
-    def commit(self) -> None:
+    def _commit(self) -> None:
         self.conn.commit()
 
-    # ── write ─────────────────────────────────────────────────
-    def upsert_trace(
-        self, trace_id, *, host, root_span_id, status, duration_ms,
-        error, metadata, created_at, updated_at,
-    ) -> None:
-        self.conn.execute(
-            """INSERT OR REPLACE INTO traces(trace_id, host, root_span_id,
-                 status, duration_ms, error, metadata, created_at, updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (trace_id, host, root_span_id, status, duration_ms, error,
-             json.dumps(metadata, ensure_ascii=False), created_at, updated_at),
-        )
+    def write_batch(self, traces: list[dict], spans: list[dict]) -> None:
+        # Validate the entire batch before any SQL is executed.
+        trace_values = [_trace_values(t) for t in traces]
+        span_values = [_span_values(s) for s in spans]
+        with self._lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                roots = {}
+                for trace in traces:
+                    key = (trace["trace_id"], trace["host"])
+                    if key not in roots:
+                        existing = self.conn.execute(
+                            "SELECT root_span_id FROM traces WHERE trace_id=? AND host=?", key
+                        ).fetchone()
+                        roots[key] = existing[0] if existing else trace["root_span_id"]
+                    if roots[key] != trace["root_span_id"]:
+                        raise ValueError(f"trace {key[0]!r} for host {key[1]!r} already has a different root; use a new trace_id")
+                self.conn.executemany(_TRACE_SQL, trace_values)
+                self.conn.executemany(_SPAN_SQL, span_values)
+                self._commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
 
-    def insert_span(
-        self, span_id, trace_id, parent_span_id, operation,
-        duration_ms, status, metadata, created_at,
-    ) -> None:
-        self.conn.execute(
-            """INSERT INTO trace_spans(span_id, trace_id, parent_span_id,
-                 operation, duration_ms, status, metadata, created_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (span_id, trace_id, parent_span_id, operation, duration_ms,
-             status, json.dumps(metadata, ensure_ascii=False), created_at),
-        )
+    @_locked
+    def get_traces(self, trace_id: str) -> list[dict]:
+        return [self._row_dict(row) for row in self.conn.execute(
+            "SELECT * FROM traces WHERE trace_id = ? ORDER BY host", (trace_id,))]
 
-    # ── query ─────────────────────────────────────────────────
-    def get_trace(self, trace_id: str, *, host: str = "") -> dict | None:
-        if host:
-            row = self.conn.execute(
-                "SELECT * FROM traces WHERE trace_id = ? AND host = ?",
-                (trace_id, host),
-            ).fetchone()
-        else:
-            row = self.conn.execute(
-                "SELECT * FROM traces WHERE trace_id = ?", (trace_id,)
-            ).fetchone()
-        return self._row_dict(row) if row else None
+    @_locked
+    def get_trace(self, trace_id: str, *, host: str | None = None) -> dict | None:
+        if host is not None:
+            row = self.conn.execute("SELECT * FROM traces WHERE trace_id = ? AND host = ?",
+                                    (trace_id, host)).fetchone()
+            return self._row_dict(row) if row else None
+        traces = self.get_traces(trace_id)
+        if len(traces) > 1:
+            hosts = ", ".join(repr(t["host"]) for t in traces)
+            raise ValueError(f"trace {trace_id} has multiple hosts ({hosts}); specify host or use build_span_trees")
+        return traces[0] if traces else None
 
-    def list_traces(self, limit: int = 20, offset: int = 0, *,
-                    status: str = "", host: str = "",
-                    filters: dict | None = None) -> list[dict]:
-        sql = "SELECT * FROM traces"
+    @_locked
+    def list_traces(self, limit: int = 20, offset: int = 0, *, status: str = "",
+                    host: str | None = None, filters: dict | None = None) -> list[dict]:
+        if limit < 0 or offset < 0:
+            raise ValueError("limit and offset must be non-negative")
         where, params = self._where(status=status, host=host, filters=filters)
-        if where:
-            sql += " WHERE " + where
-        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        params += [limit, offset]
-        return [self._row_dict(r)
-                for r in self.conn.execute(sql, params).fetchall()]
+        sql = "SELECT * FROM traces" + (f" WHERE {where}" if where else "")
+        sql += " ORDER BY created_at DESC, trace_id, host LIMIT ? OFFSET ?"
+        return [self._row_dict(row) for row in self.conn.execute(sql, [*params, limit, offset])]
 
-    def count_traces(self, *, status: str = "", host: str = "") -> int:
-        sql = "SELECT COUNT(*) c FROM traces"
-        where, params = self._where(status=status, host=host)
-        if where:
-            sql += " WHERE " + where
-        return self.conn.execute(sql, params).fetchone()["c"]
+    @_locked
+    def count_traces(self, *, status: str = "", host: str | None = None,
+                     filters: dict | None = None) -> int:
+        where, params = self._where(status=status, host=host, filters=filters)
+        sql = "SELECT COUNT(*) FROM traces" + (f" WHERE {where}" if where else "")
+        return self.conn.execute(sql, params).fetchone()[0]
 
-    def get_trace_spans(self, trace_id: str, *, host: str = "") -> list[dict]:
-        rows = self.conn.execute(
-            """SELECT * FROM trace_spans WHERE trace_id = ?
-               ORDER BY created_at, rowid""",
-            (trace_id,),
-        ).fetchall()
-        spans = [self._row_dict(r) for r in rows]
-        if not host:
+    @_locked
+    def get_trace_spans(self, trace_id: str, *, host: str | None = None) -> list[dict]:
+        spans = [self._row_dict(row) for row in self.conn.execute(
+            "SELECT * FROM trace_spans WHERE trace_id = ? ORDER BY created_at, rowid", (trace_id,))]
+        if host is None:
             return spans
-        # host-scoped: only the subtree rooted at that host's root span
-        root_id = self._root_span_id(trace_id, host)
-        if root_id is None:
-            return []
-        children: dict[str, list[dict]] = {}
-        for s in spans:
-            children.setdefault(s["parent_span_id"] or "", []).append(s)
-        out: list[dict] = []
-        queue = [root_id]
-        while queue:
-            sid = queue.pop(0)
-            for s in spans:
-                if s["span_id"] == sid:
-                    out.append(s)
-                    break
-            queue.extend(c["span_id"] for c in children.get(sid, []))
-        return out
-
-    def _root_span_id(self, trace_id: str, host: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT root_span_id FROM traces WHERE trace_id = ? AND host = ?",
-            (trace_id, host),
-        ).fetchone()
-        return row["root_span_id"] if row and row["root_span_id"] else None
-
-    def build_span_tree(self, trace_id: str, *, host: str = "") -> dict | None:
-        spans = self.get_trace_spans(trace_id, host=host)
-        if not spans:
-            return None
         trace = self.get_trace(trace_id, host=host)
+        return subtree(spans, trace["root_span_id"]) if trace else []
 
-        children_by_parent: dict[str, list[dict]] = {}
-        for s in spans:
-            pid = s["parent_span_id"] or "__root__"
-            children_by_parent.setdefault(pid, []).append(s)
+    @_locked
+    def build_span_tree(self, trace_id: str, *, host: str | None = None) -> dict | None:
+        return super().build_span_tree(trace_id, host=host)
 
-        root = next((s for s in spans if s["parent_span_id"] is None), None)
-        if root is None:
-            return {"trace": trace, "tree": None}
+    @_locked
+    def build_span_trees(self, trace_id: str) -> list[dict]:
+        return super().build_span_trees(trace_id)
 
-        def nest(span: dict) -> dict:
-            span = dict(span)
-            span["children"] = [
-                nest(dict(c))
-                for c in children_by_parent.get(span["span_id"], [])
-            ]
-            return span
+    @_locked
+    def operation_stats(self, *, host: str | None = None, filters: dict | None = None,
+                        operation: str | None = None) -> list[dict]:
+        sql, params = "", []
+        if host is not None or filters:
+            where, params = self._where(host=host, filters=filters)
+            sql = """WITH RECURSIVE selected(span_id) AS (
+                SELECT root_span_id FROM traces WHERE """ + where + """
+                UNION SELECT s.span_id FROM trace_spans s JOIN selected p
+                ON s.parent_span_id = p.span_id) """
+        sql += "SELECT operation, COUNT(*) calls, COALESCE(AVG(duration_ms),0) avg_ms, COALESCE(MAX(duration_ms),0) max_ms FROM trace_spans"
+        clauses = []
+        if host is not None or filters:
+            clauses.append("span_id IN (SELECT span_id FROM selected)")
+        if operation is not None:
+            clauses.append("operation = ?")
+            params.append(operation)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " GROUP BY operation ORDER BY avg_ms DESC, operation"
+        return [dict(row) for row in self.conn.execute(sql, params)]
 
-        return {"trace": trace, "tree": nest(root)}
-
-    def stats(self) -> dict:
-        conn = self.conn
-        overall = conn.execute(
-            """SELECT COUNT(*) as total,
-                      COALESCE(AVG(duration_ms), 0) as avg_ms,
-                      COALESCE(MIN(duration_ms), 0) as min_ms,
-                      COALESCE(MAX(duration_ms), 0) as max_ms
-               FROM traces WHERE status = 'done'"""
-        ).fetchone()
-        # Distribution by hop count (host sets hop_count in metadata when
-        # the concept exists; traces without it are excluded)
-        by_hops = conn.execute(
-            """SELECT json_extract(metadata, '$.hop_count') as hop_count,
-                      COUNT(*) as cnt,
-                      COALESCE(AVG(duration_ms), 0) as avg_ms
-               FROM traces
-               WHERE status = 'done'
-                 AND json_extract(metadata, '$.hop_count') IS NOT NULL
-               GROUP BY json_extract(metadata, '$.hop_count')
-               ORDER BY hop_count"""
-        ).fetchall()
-        tool_stats = conn.execute(
-            """SELECT operation, COUNT(*) as calls,
-                      COALESCE(AVG(duration_ms), 0) as avg_ms,
-                      COALESCE(MAX(duration_ms), 0) as max_ms
-               FROM trace_spans
-               WHERE operation LIKE 'tool.%'
-               GROUP BY operation ORDER BY avg_ms DESC"""
-        ).fetchall()
-        failed = conn.execute(
-            "SELECT COUNT(*) c FROM traces WHERE status = 'failed'"
-        ).fetchone()["c"]
-        return {
-            "overall": dict(overall),
-            "failed_count": failed,
-            "by_hops": [dict(r) for r in by_hops],
-            "tool_stats": [dict(r) for r in tool_stats],
-        }
-
-    # ── helpers ───────────────────────────────────────────────
-    @staticmethod
-    def _row_dict(row: sqlite3.Row) -> dict:
-        d = dict(row)
-        d["metadata"] = json.loads(d["metadata"] or "{}")
-        return d
+    @_locked
+    def stats(self, *, host: str | None = None, filters: dict | None = None) -> dict:
+        where, params = self._where(host=host, filters=filters)
+        successful = (where + " AND " if where else "") + "status = 'done'"
+        overall = self.conn.execute("""SELECT COUNT(*) total,
+            COALESCE(AVG(duration_ms),0) avg_ms, COALESCE(MIN(duration_ms),0) min_ms,
+            COALESCE(MAX(duration_ms),0) max_ms FROM traces WHERE """ + successful, params).fetchone()
+        failed = (where + " AND " if where else "") + "status = 'failed'"
+        failures = self.conn.execute("SELECT COUNT(*) FROM traces WHERE " + failed, params).fetchone()[0]
+        operations = self.operation_stats(host=host, filters=filters)
+        # Compatibility views for existing hosts; generic consumers use operations.
+        by_hops = self.conn.execute("""SELECT json_extract(metadata,'$.hop_count') hop_count,
+            COUNT(*) cnt, COALESCE(AVG(duration_ms),0) avg_ms FROM traces WHERE """ + successful + """
+            AND json_extract(metadata,'$.hop_count') IS NOT NULL
+            GROUP BY hop_count ORDER BY hop_count""", params).fetchall()
+        return dict(overall=dict(overall), failed_count=failures, operations=operations,
+                    by_hops=[dict(row) for row in by_hops],
+                    tool_stats=[row for row in operations if row["operation"].startswith("tool.")])
 
     @staticmethod
-    def _where(*, status: str = "", host: str = "",
-               filters: dict | None = None) -> tuple[str, list]:
-        clauses: list[str] = []
-        params: list = []
+    def _row_dict(row) -> dict:
+        result = dict(row)
+        if "metadata" in result:
+            result["metadata"] = json.loads(result["metadata"] or "{}")
+        return result
+
+    @staticmethod
+    def _where(*, status: str = "", host: str | None = None, filters: dict | None = None):
+        clauses, params = [], []
         if status:
             clauses.append("status = ?")
             params.append(status)
-        if host:
+        if host is not None:
             clauses.append("host = ?")
             params.append(host)
         for key, value in (filters or {}).items():
-            if "__" in key:
-                path, op = key.rsplit("__", 1)
-            else:
-                path, op = key, "eq"
+            path, op = key.rsplit("__", 1) if "__" in key else (key, "eq")
             if op not in _OPS:
-                raise ValueError(
-                    f"unsupported filter op {op!r} (key={key!r}); "
-                    f"supported: {', '.join(sorted(_OPS))}")
+                raise ValueError(f"unsupported filter op {op!r} (key={key!r}); supported: {', '.join(_OPS)}")
             clauses.append(f"json_extract(metadata, ?) {_OPS[op]}")
-            params += [f"$.{path}", _norm_value(op, value)]
+            params.extend((f"$.{path}", _norm_value(op, value)))
         return " AND ".join(clauses), params

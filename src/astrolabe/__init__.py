@@ -22,14 +22,16 @@ from .context import (
     set_collector,
 )
 from .storage import StorageBackend
+from .metadata import CaptureLimits
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "Astrolabe",
     "SpanCollector",
     "SpanHandle",
     "StorageBackend",
+    "CaptureLimits",
     "get_collector",
     "get_trace_context",
     "set_collector",

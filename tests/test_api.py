@@ -97,7 +97,7 @@ def test_flush_failure_does_not_mask_business_exception(tmp_path):
     """If flush fails (broken backend), the host's own exception must still
     propagate and the collector context must be reset."""
     class BrokenBackend(SQLiteBackend):
-        def commit(self):
+        def _commit(self):
             raise RuntimeError("disk on fire")
 
     backend = BrokenBackend(str(tmp_path / "t.db"))
@@ -114,6 +114,8 @@ def test_flush_failure_does_not_mask_business_exception(tmp_path):
         # context reset: ambient spans afterwards are no-ops again
         from astrolabe import get_collector
         assert get_collector() is None
+        assert not backend.conn.in_transaction
+        assert backend.count_traces() == 0
     finally:
         a.close()
 

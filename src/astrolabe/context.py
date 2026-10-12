@@ -20,7 +20,8 @@ _current_collector: ContextVar["SpanCollector | None"] = ContextVar(
 
 def get_collector() -> "SpanCollector | None":
     """Return the ambient collector for the current task/thread, or None."""
-    return _current_collector.get()
+    collector = _current_collector.get()
+    return collector if collector is not None and collector.lifecycle == "active" else None
 
 
 def get_trace_context() -> dict | None:
@@ -29,7 +30,7 @@ def get_trace_context() -> dict | None:
     The first system generates the trace_id; a downstream host passes it
     into its own ``trace()``/``atrace()`` entry point so the whole chain
     shares one id. Returns None when tracing is inactive (ambient no-op)."""
-    collector = _current_collector.get()
+    collector = get_collector()
     if collector is None:
         return None
     return {"trace_id": collector.global_trace_id, "host": collector.host}
